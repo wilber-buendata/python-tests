@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from google import genai
-from agent import plan_graph
+from langgraph.checkpoint.postgres import PostgresSaver
+from agent import create_graph
 
 from dotenv import load_dotenv
 
@@ -72,23 +73,37 @@ async def stream_plan(
 
     file_name = UPLOAD_REGISTRY[upload_id]
 
-    async def event_generator():
-        # Run LangGraph with custom streaming
-        async for mode, chunk in plan_graph.astream(
-            {
-                "upload_file_name": file_name,
-                "user_instructions": user_instructions,
-                "model": os.getenv("GEMINI_MODEL"),
-            },
-            stream_mode=["custom"],
-        ):
-            if mode != "custom":
-                continue
+    postgres_url = os.getenv("POSTGRES_URL")
+    if not postgres_url:
+        return JSONResponse({"error": "POSTGRES_URL not configured"}, status_code=500)
 
-            # chunk is what we wrote via writer({...})
-            if chunk.get("type") == "token":
-                yield {"event": "token", "data": chunk["text"]}
-            elif chunk.get("type") == "done":
-                yield {"event": "done", "data": ""}
+    def event_generator():
+        # Build graph with Postgres checkpointer and stream with per-upload thread_id
+        with PostgresSaver.from_conn_string(postgres_url) as checkpointer:
+            checkpointer.setup()
+            graph = create_graph(checkpointer)
+
+            config = {"configurable": {"thread_id": upload_id}}
+
+            for mode, chunk in graph.stream(
+                {
+                    "upload_file_name": file_name,
+                    "user_instructions": user_instructions,
+                    "model": os.getenv("GEMINI_MODEL"),
+                },
+                config=config,
+                stream_mode=["custom"],
+            ):
+                if mode != "custom":
+                    continue
+
+                # chunk is what we wrote via writer({...})
+                if chunk.get("type") == "token":
+                    yield {"event": "token", "data": chunk["text"]}
+                elif chunk.get("type") == "done":
+                    yield {"event": "done", "data": ""}
 
     return EventSourceResponse(event_generator())
+
+
+# uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1

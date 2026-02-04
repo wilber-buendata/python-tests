@@ -1,9 +1,11 @@
 # agent.py
 from __future__ import annotations
 
+import asyncio
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.config import get_stream_writer
+from langgraph.checkpoint.postgres import PostgresSaver
 
 from google import genai
 from google.genai import types
@@ -20,7 +22,7 @@ NON-NEGOTIABLE OUTPUT RULES
 - Do NOT include preambles, explanations, warnings, or meta commentary.
 - Do NOT include any sections other than the exact headings specified below.
 - Do NOT add extra bullet types, tables, or numbering styles outside what is requested.
-- Use ONLY the activity types: book, page, assign.
+- Use ONLY the activity types: book, quiz, assign.
 - Do NOT invent facts that are not supported by the syllabus. If something essential is missing, write a minimal assumption using the exact prefix: "Assumption: ..."
 
 REQUIRED MARKDOWN STRUCTURE (EXACT)
@@ -34,7 +36,7 @@ REQUIRED MARKDOWN STRUCTURE (EXACT)
 
 ### SECTION ACTIVITIES
 - **[book] <Activity Title>**: <What this activity will contain>
-- **[page] <Activity Title>**: <What this activity will contain>
+- **[quiz] <Activity Title>**: <What this activity will contain>
 - **[assign] <Activity Title>**: <What this activity will contain>
 
 ## <Section Title 2>
@@ -43,7 +45,7 @@ REQUIRED MARKDOWN STRUCTURE (EXACT)
 
 ### SECTION ACTIVITIES
 - **[book] <Activity Title>**: <What this activity will contain>
-- **[page] <Activity Title>**: <What this activity will contain>
+- **[quiz] <Activity Title>**: <What this activity will contain>
 - **[assign] <Activity Title>**: <What this activity will contain>
 
 CONTENT RULES
@@ -111,12 +113,19 @@ async def generate_plan_node(state: PlanState) -> dict:
     return {}  # we don't need to store the whole plan in state
 
 
-def create_graph():
+def generate_plan_node_sync(state: PlanState) -> dict:
+    """Synchronous wrapper for LangGraph sync runner.
+
+    LangGraph's `graph.stream` expects sync nodes when using the sync runner.
+    We bridge to the existing async implementation with asyncio.run.
+    """
+    return asyncio.run(generate_plan_node(state))
+
+
+def create_graph(checkpointer: PostgresSaver):
     g = StateGraph(PlanState)
-    g.add_node("generate_plan", generate_plan_node)
+    g.add_node("generate_plan", generate_plan_node_sync)
     g.add_edge(START, "generate_plan")
     g.add_edge("generate_plan", END)
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
-
-plan_graph = create_graph()
