@@ -122,7 +122,7 @@ async def generate_plan_node(state: PlanState) -> dict:
     )
 
     async for chunk in await client.aio.models.generate_content_stream(
-        model=state.get("model", "gemini-2.0-flash"),
+        model=state.get("model", "gemini-2.5-flash"),
         contents=[file_obj, prompt_text],
         config=config,
     ):
@@ -159,7 +159,7 @@ async def parse_plan_node(state: ContentState) -> dict:
     
     # Usamos response_json_schema con GenAI SDK
     response = await client.aio.models.generate_content(
-        model=state.get("model", "gemini-2.0-flash"),
+        model=state.get("model", "gemini-2.5-flash"),
         contents=prompt,
         config={
             "response_mime_type": "application/json",
@@ -222,7 +222,7 @@ async def _generate_generic_activity(state: ContentState, schema_class, type_lab
     
     # Llamada a Gemini forzando el esquema JSON de Pydantic
     response = await client.aio.models.generate_content(
-        model=state.get("model", "gemini-2.0-flash"),
+        model=state.get("model", "gemini-2.5-flash"),
         contents=[file_obj, prompt],
         config={
             "response_mime_type": "application/json",

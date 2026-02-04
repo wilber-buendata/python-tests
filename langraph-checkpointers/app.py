@@ -85,7 +85,7 @@ async def stream_plan(upload_id: str, user_instructions: str = ""):
                 {
                     "upload_file_name": file_name,
                     "user_instructions": user_instructions,
-                    "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                    "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                 },
                 config=config,
                 stream_mode=["custom"],
@@ -135,7 +135,7 @@ async def stream_content(upload_id: str):
                 {
                     "upload_file_name": file_name,
                     "markdown_plan": markdown_plan,
-                    "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                    "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                     "activities_queue": [], # Se llenará en el primer nodo
                     "generated_content": []
                 },
