@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>SSE Resume Demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 20px; }
+      button { padding: 10px 14px; }
+      pre { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; margin-top: 12px; min-height: 180px; }
+      .row { display: flex; gap: 10px; align-items: center; }
+      .muted { color: #666; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <button id="startBtn">Start</button>
+      <span class="muted" id="status"></span>
+    </div>
+
+    <pre id="out"></pre>
+
+    <script>
+      const API_BASE = "http://localhost:9000";
+
+      const startBtn = document.getElementById("startBtn");
+      const out = document.getElementById("out");
+      const statusEl = document.getElementById("status");
+
+      // Keys en localStorage
+      const LS_THREAD_ID = "demo.thread_id";
+      const LS_RUNNING   = "demo.running";
+
+      let es = null;
+
+      function setRunning(isRunning) {
+        localStorage.setItem(LS_RUNNING, isRunning ? "1" : "0");
+        startBtn.disabled = isRunning;
+        statusEl.textContent = isRunning ? "Generando… (si recargas, se reanuda)" : "Listo";
+      }
+
+      function getRunning() {
+        return localStorage.getItem(LS_RUNNING) === "1";
+      }
+
+      function setThreadId(threadId) {
+        localStorage.setItem(LS_THREAD_ID, threadId);
+      }
+
+      function getThreadId() {
+        return localStorage.getItem(LS_THREAD_ID);
+      }
+
+      function clearSession() {
+        localStorage.removeItem(LS_THREAD_ID);
+        localStorage.removeItem(LS_RUNNING);
+      }
+
+      function closeStream() {
+        if (es) {
+          es.close();
+          es = null;
+        }
+      }
+
+      function connectStream(threadId) {
+        closeStream();
+
+        // Nota: EventSource reconecta solo si hay cortes.
+        es = new EventSource(`${API_BASE}/threads/${threadId}/stream`);
+
+        es.onopen = () => {
+          // En open no asumimos done; solo mostramos estado.
+          setRunning(true);
+        };
+
+        es.onmessage = (evt) => {
+          // evt.data trae el "token" (con \n escapado)
+          out.textContent += evt.data.replaceAll("\\n", "\n");
+        };
+
+        es.addEventListener("done", () => {
+          // Terminó
+          closeStream();
+          setRunning(false);
+
+          // opcional: si quieres que el botón cree un nuevo thread cada vez,
+          // puedes limpiar el thread_id aquí:
+          // clearSession();
+
+          statusEl.textContent = "Terminado ✅ (puedes iniciar otra vez)";
+        });
+
+        es.onerror = () => {
+          // EventSource reintenta solo. Solo cambiamos UI para que el usuario sepa.
+          statusEl.textContent = "Conexión perdida… reintentando (la generación sigue en servidor)";
+        };
+      }
+
+      async function startNewThread() {
+        out.textContent = ""; // limpia salida para una nueva corrida
+
+        setRunning(true);
+        statusEl.textContent = "Creando thread…";
+
+        const r = await fetch(`${API_BASE}/threads`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ prompt: "Hola, genera algo largo y persistente." })
+        });
+
+        if (!r.ok) {
+          setRunning(false);
+          const txt = await r.text();
+          throw new Error(`Error creando thread: ${txt}`);
+        }
+
+        const data = await r.json();
+        const threadId = data.thread_id;
+
+        setThreadId(threadId);
+        setRunning(true);
+        statusEl.textContent = `Conectando… (${threadId})`;
+
+        connectStream(threadId);
+      }
+
+      // --- Boot (cuando carga o recarga la página)
+      (async function boot() {
+        const threadId = getThreadId();
+        const running = getRunning();
+
+        if (threadId && running) {
+          // Caso clave: recargó mientras seguía "en curso"
+          startBtn.disabled = true;
+          statusEl.textContent = `Reanudando… (${threadId})`;
+
+          // (Opcional) si quieres evitar duplicados visuales, puedes recuperar el estado completo
+          // del servidor antes de reconectar y mostrarlo. Pero con SSE + Last-Event-ID,
+          // el browser suele pedir desde el último id si el stream se reconectó antes.
+          //
+          // Para caso de recarga total, no hay Last-Event-ID guardado: entonces verás tokens desde 0.
+          // Si quieres EXACTAMENTE "continuar visualmente" sin reimprimir todo,
+          // guarda out.textContent en localStorage también. Te dejo la opción comentada abajo.
+
+          connectStream(threadId);
+          setRunning(true);
+          return;
+        }
+
+        // no hay sesión activa
+        startBtn.disabled = false;
+        statusEl.textContent = "Listo";
+      })();
+
+      // Acción del botón
+      startBtn.onclick = async () => {
+        try {
+          await startNewThread();
+        } catch (e) {
+          console.error(e);
+          statusEl.textContent = "Error: " + e.message;
+          setRunning(false);
+        }
+      };
+
+      // ---- OPCIONAL (mejora UX): persistir texto para que al recargar NO reimprima desde 0
+      // Si quieres esto, descomenta y usa LS_OUTPUT.
+      //
+      // const LS_OUTPUT = "demo.output";
+      //
+      // function setOutput(s) { localStorage.setItem(LS_OUTPUT, s); }
+      // function getOutput() { return localStorage.getItem(LS_OUTPUT) || ""; }
+      //
+      // En onmessage:
+      //   out.textContent += ...
+      //   setOutput(out.textContent)
+      //
+      // En boot, antes de connectStream:
+      //   out.textContent = getOutput();
+      //
+      // En startNewThread:
+      //   localStorage.removeItem(LS_OUTPUT);
+    </script>
+  </body>
+</html>

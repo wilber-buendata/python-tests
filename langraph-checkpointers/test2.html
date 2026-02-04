@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>SSE Resume Demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 20px; }
+      button { padding: 10px 14px; }
+      pre { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; margin-top: 12px; min-height: 180px; }
+      .row { display: flex; gap: 10px; align-items: center; }
+      .muted { color: #666; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <div class="row" style="margin-bottom: 10px">
+      <input type="file" id="fileInput" accept="application/pdf" />
+      <button id="startBtn">Planificar</button>
+      <span class="muted" id="status"></span>
+    </div>
+
+    <div class="row" style="margin-bottom: 10px">
+      <input
+        type="text"
+        id="instructionsInput"
+        placeholder="Instrucciones opcionales para la planificación"
+        style="flex: 1"
+      />
+    </div>
+
+    <pre id="out"></pre>
+
+    <script>
+      const API_BASE = "http://localhost:9000";
+
+      const startBtn = document.getElementById("startBtn");
+      const fileInput = document.getElementById("fileInput");
+      const instructionsInput = document.getElementById("instructionsInput");
+      const out = document.getElementById("out");
+      const statusEl = document.getElementById("status");
+
+      let es = null;
+
+      function setRunning(isRunning) {
+        startBtn.disabled = isRunning;
+        fileInput.disabled = isRunning;
+        instructionsInput.disabled = isRunning;
+        statusEl.textContent = isRunning ? "Planificando…" : "Listo";
+      }
+
+      function closeStream() {
+        if (es) {
+          es.close();
+          es = null;
+        }
+      }
+
+      function connectStream(uploadId, userInstructions) {
+        closeStream();
+
+        const params = new URLSearchParams({
+          upload_id: uploadId,
+          user_instructions: userInstructions || "",
+        });
+
+        es = new EventSource(`${API_BASE}/stream?${params.toString()}`);
+
+        es.onopen = () => {
+          setRunning(true);
+        };
+
+        // Tokens llegan como evento personalizado "token"
+        es.addEventListener("token", (evt) => {
+          out.textContent += evt.data.replaceAll("\\n", "\n");
+        });
+
+        es.addEventListener("done", () => {
+          closeStream();
+          setRunning(false);
+          statusEl.textContent = "Planificación terminada ✅";
+        });
+
+        es.onerror = () => {
+          statusEl.textContent = "Conexión perdida… reintentando";
+        };
+      }
+
+      async function uploadAndPlan() {
+        const file = fileInput.files[0];
+        if (!file) {
+          statusEl.textContent = "Selecciona un PDF primero";
+          return;
+        }
+
+        out.textContent = "";
+        setRunning(true);
+        statusEl.textContent = "Subiendo PDF…";
+
+        const formData = new FormData();
+        formData.append("file", file);
+
+        const r = await fetch(`${API_BASE}/upload`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!r.ok) {
+          setRunning(false);
+          const txt = await r.text();
+          statusEl.textContent = "Error subiendo PDF";
+          console.error("Error upload:", txt);
+          return;
+        }
+
+        const data = await r.json();
+        const uploadId = data.upload_id;
+
+        if (!uploadId) {
+          setRunning(false);
+          statusEl.textContent = "Respuesta inválida del servidor";
+          return;
+        }
+
+        statusEl.textContent = "Iniciando planificación…";
+        const userInstructions = instructionsInput.value || "";
+        connectStream(uploadId, userInstructions);
+      }
+
+      // Estado inicial
+      setRunning(false);
+
+      startBtn.onclick = async () => {
+        try {
+          await uploadAndPlan();
+        } catch (e) {
+          console.error(e);
+          statusEl.textContent = "Error: " + e.message;
+          setRunning(false);
+        }
+      };
+    </script>
+  </body>
+</html>
