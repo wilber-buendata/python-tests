@@ -257,16 +257,25 @@ def run_async_node(node_func, state):
     return asyncio.run(node_func(state))
 
 def create_content_graph(checkpointer: PostgresSaver):
+    # Create a new state graph that will manage the JSON content generation flow
     g = StateGraph(ContentState)
-    
+
+    # Node 1: parse the Markdown plan and extract a queue of activities
     g.add_node("parse_plan", lambda s: run_async_node(parse_plan_node, s))
+
+    # Nodes 2–4: generate concrete content for each activity type
+    # Each node consumes the next activity in the queue and appends the
+    # generated JSON to the accumulated "generated_content" list
     g.add_node("generate_quiz", lambda s: run_async_node(generate_quiz_node, s))
     g.add_node("generate_book", lambda s: run_async_node(generate_book_node, s))
     g.add_node("generate_assign", lambda s: run_async_node(generate_assign_node, s))
-    
+
+    # The graph always starts by parsing the full Markdown plan
     g.add_edge(START, "parse_plan")
-    
-    # Router condicional
+
+    # After parsing the plan, we call "router_node" to decide what to do next
+    # - If there are no activities left in the queue, it returns "end" and the graph finishes
+    # - If there is a next activity, it returns one of: "generate_quiz", "generate_book", "generate_assign"
     g.add_conditional_edges(
         "parse_plan",
         router_node,
@@ -274,22 +283,45 @@ def create_content_graph(checkpointer: PostgresSaver):
             "generate_quiz": "generate_quiz",
             "generate_book": "generate_book",
             "generate_assign": "generate_assign",
-            "end": END
-        }
-    )
-    
-    # Después de generar cualquiera, volvemos al router para ver si queda algo en la cola
-    g.add_conditional_edges(
-        "generate_quiz", router_node, 
-        {"generate_quiz": "generate_quiz", "generate_book": "generate_book", "generate_assign": "generate_assign", "end": END}
-    )
-    g.add_conditional_edges(
-        "generate_book", router_node,
-        {"generate_quiz": "generate_quiz", "generate_book": "generate_book", "generate_assign": "generate_assign", "end": END}
-    )
-    g.add_conditional_edges(
-        "generate_assign", router_node,
-        {"generate_quiz": "generate_quiz", "generate_book": "generate_book", "generate_assign": "generate_assign", "end": END}
+            "end": END,
+        },
     )
 
+    # After any content node finishes, we go back to the router again
+    # The router will look at the remaining queue and:
+    # - send the graph to the appropriate generator node for the next activity, or
+    # - send the graph to END when there are no more activities to process
+    g.add_conditional_edges(
+        "generate_quiz",
+        router_node,
+        {
+            "generate_quiz": "generate_quiz",
+            "generate_book": "generate_book",
+            "generate_assign": "generate_assign",
+            "end": END,
+        },
+    )
+    g.add_conditional_edges(
+        "generate_book",
+        router_node,
+        {
+            "generate_quiz": "generate_quiz",
+            "generate_book": "generate_book",
+            "generate_assign": "generate_assign",
+            "end": END,
+        },
+    )
+    g.add_conditional_edges(
+        "generate_assign",
+        router_node,
+        {
+            "generate_quiz": "generate_quiz",
+            "generate_book": "generate_book",
+            "generate_assign": "generate_assign",
+            "end": END,
+        },
+    )
+
+    # Finally, compile the graph with the provided Postgres checkpointer
+    # so that executions can be persisted and resumed.
     return g.compile(checkpointer=checkpointer)
