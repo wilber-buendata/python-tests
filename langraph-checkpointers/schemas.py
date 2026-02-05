@@ -197,6 +197,17 @@ class QuizModSettings(BaseModel):
         )
     )
 
+class QuestionTask(BaseModel):
+    """Define la intención de una sola pregunta antes de generarla."""
+    question_type: Literal["truefalse", "multichoice", "essay"]
+    topic_focus: str = Field(description="El concepto específico del syllabus que esta pregunta evaluará.")
+    difficulty: Literal["easy", "medium", "hard"]
+
+class QuizBlueprint(BaseModel):
+    """El plan maestro del quiz antes de generar el contenido real."""
+    title: str
+    intro_text: str = Field(description="Texto introductorio HTML para el quiz.")
+    questions_tasks: List[QuestionTask] = Field(description="Lista de preguntas planificadas para generar.")
 
 class QuizActivity(BaseModel):
     name: str = Field(description="Título del Quiz")
