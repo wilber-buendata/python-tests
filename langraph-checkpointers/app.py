@@ -35,8 +35,8 @@ app.add_middleware(
 UPLOAD_REGISTRY: dict[str, str] = {}
 # upload_id -> markdown_plan_text (Guardamos el plan generado para usarlo luego)
 PLAN_STORAGE: dict[str, str] = {} 
-# upload_id -> final_json_content (Guardamos el JSON final generado)
-CONTENT_STORAGE: dict[str, list] = {}
+# upload_id -> { "content": [...], "usage_report": {...} }
+CONTENT_RESULT_STORAGE: dict[str, dict] = {}
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -136,8 +136,9 @@ async def stream_content(upload_id: str):
                     "upload_file_name": file_name,
                     "markdown_plan": markdown_plan,
                     "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                    "activities_queue": [], # Se llenará en el primer nodo
-                    "generated_content": []
+                    "activities_queue": [], 
+                    "generated_content": [],
+                    "usage_log": []
                 },
                 config=config,
                 stream_mode=["custom", "values"], # 'values' para obtener el estado final
@@ -151,16 +152,35 @@ async def stream_content(upload_id: str):
                 if mode == "values":
                     final_state = chunk
 
-            # Al finalizar el stream, guardamos el resultado
+            # AL FINALIZAR: Calculamos totales y estructuramos la respuesta
             if final_state and "generated_content" in final_state:
-                CONTENT_STORAGE[upload_id] = final_state["generated_content"]
-                yield {"event": "complete", "data": json.dumps({"count": len(final_state["generated_content"])})}
+                usage_log = final_state.get("usage_log", [])
+                total_input = sum(item["input_tokens"] for item in usage_log)
+                total_output = sum(item["output_tokens"] for item in usage_log)
+                total_combined = total_input + total_output
+
+                final_result_object = {
+                    "content": final_state["generated_content"],
+                    "usage_report": {
+                        "total_input_tokens": total_input,
+                        "total_output_tokens": total_output,
+                        "total_tokens": total_combined,
+                        "breakdown": usage_log
+                    }
+                }
+
+                CONTENT_RESULT_STORAGE[upload_id] = final_result_object
+
+                yield {"event": "complete", "data": json.dumps({
+                    "count": len(final_state["generated_content"]),
+                    "total_tokens": total_combined
+                })}
 
     return EventSourceResponse(event_generator())
 
 # --- ENDPOINT 3: OBTENER RESULTADO FINAL ---
 @app.get("/get-content/{upload_id}")
 async def get_content(upload_id: str):
-    if upload_id not in CONTENT_STORAGE:
+    if upload_id not in CONTENT_RESULT_STORAGE:
         return JSONResponse({"error": "Content not generated yet"}, status_code=404)
-    return JSONResponse(CONTENT_STORAGE[upload_id])
+    return JSONResponse(CONTENT_RESULT_STORAGE[upload_id])

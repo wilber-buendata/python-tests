@@ -17,7 +17,12 @@ from schemas import (
     BookActivity, 
     AssignmentActivity, 
     PlanParsingResult, 
-    PlanItem
+    PlanItem,
+    # Nuevos imports
+    QuizBlueprint,
+    TrueFalseQuestion,
+    MultichoiceQuestion,
+    EssayQuestion
 )
 
 # --- SYSTEM PROMPT DEL PLANIFICADOR (Ya existente) ---
@@ -74,6 +79,9 @@ QUALITY BAR
 - Titles must be specific and aligned with the syllabus terminology.
 - The plan must be internally consistent and cover the requested syllabus scope without adding unrelated content.
 """
+
+
+
 # --- ESTADOS DEL GRAFO ---
 
 class PlanState(TypedDict):
@@ -82,15 +90,35 @@ class PlanState(TypedDict):
     user_instructions: str
     model: str
 
+class UsageMetrics(TypedDict):
+    """Métrica individual de una llamada a la LLM."""
+    step: str             # Nombre del paso (ej: "Quiz Blueprint", "Q1 TrueFalse")
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    model_name: str
+
 class ContentState(TypedDict):
-    """Estado para la generación del contenido (JSON)."""
+    """Estado actualizado con log de uso."""
     upload_file_name: str
     model: str
-    markdown_plan: str         # El plan completo en texto
-    activities_queue: List[PlanItem] # Lista de actividades pendientes por generar
-    current_activity: Optional[PlanItem] # Actividad actual siendo procesada
-    generated_content: List[dict] # Resultados acumulados
+    markdown_plan: str
+    activities_queue: List[PlanItem]
+    # Nuevo campo para acumular métricas
+    usage_log: List[UsageMetrics] 
+    generated_content: List[dict]
 
+# --- HELPER PARA EXTRAER TOKENS ---
+def log_token_usage(response: Any, step_name: str, model: str) -> UsageMetrics:
+    """Extrae la metadata de uso de la respuesta de Gemini."""
+    usage = response.usage_metadata
+    return {
+        "step": step_name,
+        "input_tokens": usage.prompt_token_count,
+        "output_tokens": usage.candidates_token_count,
+        "total_tokens": usage.total_token_count,
+        "model_name": model
+    }
 # --- FUNCIONES DE AYUDA ---
 
 def get_client():
@@ -148,6 +176,8 @@ async def parse_plan_node(state: ContentState) -> dict:
     writer({"type": "status", "text": "Analyzing plan structure..."})
     
     client = get_client()
+
+    current_log = state.get("usage_log", [])
     
     prompt = f"""
     Analyze the following Course Plan Markdown and extract all activities listed under 'SECTION ACTIVITIES'.
@@ -166,13 +196,19 @@ async def parse_plan_node(state: ContentState) -> dict:
             "response_json_schema": PlanParsingResult.model_json_schema(),
         },
     )
+
+    metrics = log_token_usage(response, "Parse Plan Structure", state.get("model"))
     
     # Parseamos la respuesta con Pydantic
     parsed_result = PlanParsingResult.model_validate_json(response.text)
     
     writer({"type": "status", "text": f"Found {len(parsed_result.activities)} activities to generate."})
     
-    return {"activities_queue": parsed_result.activities, "generated_content": []}
+    return {
+        "activities_queue": parsed_result.activities, 
+        "generated_content": [],
+        "usage_log": current_log + [metrics] # Añadimos al historial
+    }
 
 def router_node(state: ContentState) -> str:
     """Decide qué nodo ejecutar basándose en la siguiente actividad."""
@@ -183,8 +219,130 @@ def router_node(state: ContentState) -> str:
     next_activity = queue[0]
     return f"generate_{next_activity.activity_type}" # generate_quiz, generate_book, generate_assign
 
+
 async def generate_quiz_node(state: ContentState) -> dict:
-    return await _generate_generic_activity(state, QuizActivity, "quiz")
+    """
+    Genera un Quiz en dos fases:
+    1. Blueprint: Define qué preguntas hacer.
+    2. Construction: Genera cada pregunta individualmente.
+    """
+    writer = get_stream_writer()
+    client = get_client()
+    model = state.get("model", "gemini-2.5-flash")
+    
+    # 1. Obtener contexto actual
+    current_activity: PlanItem = state["activities_queue"][0]
+    remaining_queue = state["activities_queue"][1:]
+    file_obj = client.files.get(name=state["upload_file_name"])
+    current_log = state.get("usage_log", [])
+    
+    writer({"type": "status", "text": f"Planning Quiz: {current_activity.title}..."})
+
+    # 2. FASE 1: Generar el Blueprint (El Arquitecto)
+    blueprint_prompt = f"""
+    You are an expert Instructional Designer designed to plan a Moodle Quiz.
+    
+    CONTEXT:
+    - Activity Title: {current_activity.title}
+    - Section: {current_activity.section}
+    - Intent: {current_activity.description_intent}
+    
+    TASK:
+    Create a 'QuizBlueprint' that outlines the questions needed to cover this topic effectively based on the Syllabus PDF.
+    - Select a mix of question types (True/False, Multichoice, Essay) appropriate for the difficulty.
+    - Do NOT generate the full question content yet, just the topic and type.
+    - Plan for approximately 5-10 questions unless the intent implies otherwise.
+    """
+
+    bp_response = await client.aio.models.generate_content(
+        model=model,
+        contents=[file_obj, blueprint_prompt],
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": QuizBlueprint.model_json_schema(),
+        },
+    )
+    bp_metrics = log_token_usage(bp_response, f"Quiz Blueprint: {current_activity.title}", model)
+    current_log.append(bp_metrics)
+    blueprint = QuizBlueprint.model_validate_json(bp_response.text)
+
+    # 3. FASE 2: Generación Iterativa de Preguntas (Los Especialistas)
+    generated_questions = []
+    total_q = len(blueprint.questions_tasks)
+
+    for idx, task in enumerate(blueprint.questions_tasks):
+        writer({"type": "status", "text": f"Generating Q{idx+1}/{total_q}: [{task.question_type}] {task.topic_focus}..."})
+        
+        # Seleccionar esquema y prompt según el tipo
+        if task.question_type == "truefalse":
+            target_schema = TrueFalseQuestion
+            type_instruction = "Create a Moodle True/False question."
+        elif task.question_type == "essay":
+            target_schema = EssayQuestion
+            type_instruction = "Create a Moodle Essay question."
+        else: # multichoice
+            target_schema = MultichoiceQuestion
+            type_instruction = "Create a Moodle Multi-choice question with single or multiple answers allowed."
+
+        # Prompt específico y ligero para cada pregunta
+        # NO pasamos las preguntas anteriores para ahorrar contexto, confiamos en el Blueprint para la variedad.
+        question_prompt = f"""
+        {type_instruction}
+        
+        TOPIC FOCUS: {task.topic_focus}
+        DIFFICULTY: {task.difficulty}
+        CONTEXT: Part of quiz '{blueprint.title}' covering '{current_activity.section}'.
+        
+        REQUIREMENTS:
+        - Use the provided Syllabus PDF as ground truth.
+        - Output strict JSON matching the schema.
+        - Ensure all text fields use valid HTML.
+        - Provide helpful feedback for correct/incorrect answers.
+        """
+
+        q_response = await client.aio.models.generate_content(
+            model=model,
+            contents=[file_obj, question_prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": target_schema.model_json_schema(),
+            },
+        )
+        q_metrics = log_token_usage(q_response, f"Quiz Q{idx+1} ({task.question_type})", model)
+        current_log.append(q_metrics)
+        
+        try:
+            # Validamos y añadimos a la lista
+            q_data = target_schema.model_validate_json(q_response.text)
+            generated_questions.append(q_data)
+        except Exception as e:
+            print(f"Error parsing question {idx}: {e}")
+            # Si falla una, continuamos con las siguientes para no romper todo el proceso
+            continue
+
+    # 4. FASE 3: Ensamblaje Final
+    writer({"type": "status", "text": f"Assembling Quiz: {current_activity.title}..."})
+    
+    final_quiz = QuizActivity(
+        name=blueprint.title,
+        introeditor={"text": blueprint.intro_text},
+        mod_settings={"questions": generated_questions}
+    )
+
+    final_record = {
+        "activity_id": f"quiz_{len(state['generated_content'])}",
+        "type": "quiz",
+        "plan_context": current_activity.model_dump(),
+        "data": final_quiz.model_dump()
+    }
+
+    writer({"type": "status", "text": f"Completed Quiz {current_activity.title} ({len(generated_questions)} questions)"})
+
+    return {
+        "generated_content": state["generated_content"] + [final_record],
+        "activities_queue": remaining_queue,
+        "usage_log": current_log
+    }
 
 async def generate_book_node(state: ContentState) -> dict:
     return await _generate_generic_activity(state, BookActivity, "book")
@@ -196,6 +354,8 @@ async def _generate_generic_activity(state: ContentState, schema_class, type_lab
     """Función genérica para llamar a Gemini con un esquema específico."""
     writer = get_stream_writer()
     client = get_client()
+    model = state.get("model", "gemini-2.5-flash")
+    current_log = state.get("usage_log", [])
     
     # Sacamos la actividad actual de la cola (sin eliminarla aun del estado global hasta retornar)
     current_activity: PlanItem = state["activities_queue"][0]
@@ -222,13 +382,14 @@ async def _generate_generic_activity(state: ContentState, schema_class, type_lab
     
     # Llamada a Gemini forzando el esquema JSON de Pydantic
     response = await client.aio.models.generate_content(
-        model=state.get("model", "gemini-2.5-flash"),
+        model=model,
         contents=[file_obj, prompt],
         config={
             "response_mime_type": "application/json",
             "response_json_schema": schema_class.model_json_schema(),
         },
     )
+    metrics = log_token_usage(response, f"Generate {type_label}: {current_activity.title}", model)
     
     # Validamos y convertimos a dict
     generated_data = schema_class.model_validate_json(response.text).model_dump()
@@ -249,7 +410,8 @@ async def _generate_generic_activity(state: ContentState, schema_class, type_lab
         # NOTA: En LangGraph simple dict state, se sobreescribe. Para listas necesitamos un reducer o manejar la lista completa.
         # Aquí reescribiremos la lista completa + el nuevo.
         "generated_content": state["generated_content"] + [final_record],
-        "activities_queue": remaining_queue
+        "activities_queue": remaining_queue,
+        "usage_log": current_log + [metrics]
     }
 
 # Sync wrapper para LangGraph
