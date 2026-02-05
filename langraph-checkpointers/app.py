@@ -35,6 +35,8 @@ app.add_middleware(
 UPLOAD_REGISTRY: dict[str, str] = {}
 # upload_id -> markdown_plan_text (Guardamos el plan generado para usarlo luego)
 PLAN_STORAGE: dict[str, str] = {} 
+# upload_id -> usage_log del grafo de plan (lista de métricas)
+PLAN_USAGE_STORAGE: dict[str, list] = {}
 # upload_id -> { "content": [...], "usage_report": {...} }
 CONTENT_RESULT_STORAGE: dict[str, dict] = {}
 
@@ -76,6 +78,7 @@ async def stream_plan(upload_id: str, user_instructions: str = ""):
 
     def event_generator():
         full_markdown = ""
+        final_state = None
         with PostgresSaver.from_conn_string(postgres_url) as checkpointer:
             checkpointer.setup()
             graph = create_plan_graph(checkpointer)
@@ -88,7 +91,7 @@ async def stream_plan(upload_id: str, user_instructions: str = ""):
                     "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                 },
                 config=config,
-                stream_mode=["custom"],
+                stream_mode=["custom", "values"],
             ):
                 if mode == "custom":
                     if chunk.get("type") == "token":
@@ -97,9 +100,14 @@ async def stream_plan(upload_id: str, user_instructions: str = ""):
                         yield {"event": "token", "data": text}
                     elif chunk.get("type") == "done":
                         yield {"event": "done", "data": ""}
+                if mode == "values":
+                    final_state = chunk
         
         # Guardamos el plan generado en memoria para el siguiente paso
         PLAN_STORAGE[upload_id] = full_markdown
+        # Si el grafo de plan devolvió usage_log, lo persistimos también
+        if final_state and "usage_log" in final_state:
+            PLAN_USAGE_STORAGE[upload_id] = final_state["usage_log"]
 
     return EventSourceResponse(event_generator())
 
@@ -152,28 +160,23 @@ async def stream_content(upload_id: str):
                 if mode == "values":
                     final_state = chunk
 
-            # AL FINALIZAR: Calculamos totales y estructuramos la respuesta
+            # AL FINALIZAR: estructuramos la respuesta usando SOLO el usage_log combinado
             if final_state and "generated_content" in final_state:
-                usage_log = final_state.get("usage_log", [])
-                total_input = sum(item["input_tokens"] for item in usage_log)
-                total_output = sum(item["output_tokens"] for item in usage_log)
-                total_combined = total_input + total_output
+                # Combinamos el log del plan (si existe) con el del grafo de contenido
+                plan_usage = PLAN_USAGE_STORAGE.get(upload_id, [])
+                content_usage = final_state.get("usage_log", [])
+                usage_log = plan_usage + content_usage
 
                 final_result_object = {
                     "content": final_state["generated_content"],
-                    "usage_report": {
-                        "total_input_tokens": total_input,
-                        "total_output_tokens": total_output,
-                        "total_tokens": total_combined,
-                        "breakdown": usage_log
-                    }
+                    # usage_report es directamente el usage_log (sin agregaciones)
+                    "usage_report": usage_log,
                 }
 
                 CONTENT_RESULT_STORAGE[upload_id] = final_result_object
 
                 yield {"event": "complete", "data": json.dumps({
-                    "count": len(final_state["generated_content"]),
-                    "total_tokens": total_combined
+                    "count": len(final_state["generated_content"])
                 })}
 
     return EventSourceResponse(event_generator())

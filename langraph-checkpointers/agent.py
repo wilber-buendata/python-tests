@@ -44,6 +44,7 @@ NON-NEGOTIABLE OUTPUT RULES
 - Do NOT add extra bullet types, tables, or numbering styles outside what is requested.
 - Use ONLY the activity types: book, quiz, assign.
 - Do NOT invent facts that are not supported by the syllabus. If something essential is missing, write a minimal assumption using the exact prefix: "Assumption: ..."
+ - Always respond entirely in Spanish. All headings, bullet points and text must be in Spanish.
 
 REQUIRED MARKDOWN STRUCTURE (EXACT)
 # COURSE OVERVIEW
@@ -89,6 +90,7 @@ class PlanState(TypedDict):
     upload_file_name: str
     user_instructions: str
     model: str
+    usage_log: List[UsageMetrics]
 
 class UsageMetrics(TypedDict):
     """Métrica individual de una llamada a la LLM."""
@@ -117,6 +119,7 @@ def log_token_usage(response: Any, step_name: str, model: str) -> UsageMetrics:
         "input_tokens": usage.prompt_token_count,
         "output_tokens": usage.candidates_token_count,
         "total_tokens": usage.total_token_count,
+        "thoughts_token_count": usage.thoughts_token_count,
         "model_name": model
     }
 # --- FUNCIONES DE AYUDA ---
@@ -128,8 +131,11 @@ def get_client():
 # (Este código es casi idéntico al tuyo original, solo envuelto para exportar)
 
 async def generate_plan_node(state: PlanState) -> dict:
+
     writer = get_stream_writer()
     client = get_client()
+    model_name = state.get("model", "gemini-2.5-flash")
+    current_log = state.get("usage_log", [])
     
     file_obj = client.files.get(name=state["upload_file_name"])
     
@@ -149,16 +155,26 @@ async def generate_plan_node(state: PlanState) -> dict:
         max_output_tokens=8192,
     )
 
+    last_metrics: Optional[UsageMetrics] = None
+
     async for chunk in await client.aio.models.generate_content_stream(
-        model=state.get("model", "gemini-2.5-flash"),
+        model=model_name,
         contents=[file_obj, prompt_text],
         config=config,
     ):
-        if chunk.text:
+        if getattr(chunk, "text", None):
             writer({"type": "token", "text": chunk.text})
 
+        # Capturamos uso de tokens si viene en el stream; nos quedamos con el último
+        if getattr(chunk, "usage_metadata", None):
+            last_metrics = log_token_usage(chunk, "Generate Plan Markdown", model_name)
+
     writer({"type": "done"})
-    return {}
+
+    if last_metrics is not None:
+        current_log.append(last_metrics)
+
+    return {"usage_log": current_log}
 
 def create_plan_graph(checkpointer: PostgresSaver):
     g = StateGraph(PlanState)
@@ -198,6 +214,7 @@ async def parse_plan_node(state: ContentState) -> dict:
     )
 
     metrics = log_token_usage(response, "Parse Plan Structure", state.get("model"))
+    current_log.append(metrics)
     
     # Parseamos la respuesta con Pydantic
     parsed_result = PlanParsingResult.model_validate_json(response.text)
@@ -207,7 +224,7 @@ async def parse_plan_node(state: ContentState) -> dict:
     return {
         "activities_queue": parsed_result.activities, 
         "generated_content": [],
-        "usage_log": current_log + [metrics] # Añadimos al historial
+        "usage_log": current_log
     }
 
 def router_node(state: ContentState) -> str:
